@@ -1,0 +1,4 @@
+/accounts-api
+*.env
+.env
+.DS_Store
