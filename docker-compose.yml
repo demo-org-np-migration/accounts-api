@@ -1,0 +1,32 @@
+# Local dev only. Postgres here starts empty — accounts-api has no
+# migrations of its own (see ADR-003), so ledger-core's migrations need to
+# have run against it before the read endpoints return real data. Enough
+# on its own to bring accounts-api up and hit /health.
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: cauri
+      POSTGRES_PASSWORD: cauri
+      POSTGRES_DB: ledger
+    ports:
+      - "5432:5432"
+    volumes:
+      - accounts-api-postgres:/var/lib/postgresql/data
+
+  accounts-api:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      SERVICE_NAME: accounts-api
+      ENV: staging
+      PORT: 8080
+      LOG_LEVEL: debug
+      DATABASE_URL: postgres://cauri:cauri@postgres:5432/ledger
+      KEYCLOAK_ISSUER: http://keycloak.platform.svc:8080/realms/cauri-staging
+    depends_on:
+      - postgres
+
+volumes:
+  accounts-api-postgres:
