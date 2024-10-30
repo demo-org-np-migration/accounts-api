@@ -1,0 +1,8 @@
+apiVersion: v2
+name: accounts-api
+description: Helm chart for accounts-api, the read-side of Cauri customer accounts.
+type: application
+version: 0.3.0
+appVersion: "0.1.0"
+maintainers:
+  - name: core-banking
