@@ -1,0 +1,16 @@
+replicaCount: 1
+
+env:
+  ENV: staging
+  LOG_LEVEL: info
+  KEYCLOAK_ISSUER: http://keycloak.platform.svc:8080/realms/cauri-staging
+
+postgresSecret:
+  create: false
+  name: postgres-credentials
+  host: postgres.staging.svc
+  port: 5432
+  database: ledger
+
+serviceMonitor:
+  enabled: true
