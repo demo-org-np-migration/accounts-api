@@ -3,11 +3,14 @@ package main
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	kitlog "github.com/demo-org-np-migration/cauri-go-kit/log"
 
@@ -33,10 +36,7 @@ func run() {
 		os.Exit(1)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	pool, err := store.Connect(ctx, databaseURL)
+	pool, err := connectWithRetry(logger, databaseURL, 10, 2*time.Second)
 	if err != nil {
 		logger.Error("could not connect to ledger", "err", err)
 		os.Exit(1)
@@ -76,4 +76,26 @@ func getEnv(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// connectWithRetry retries store.Connect up to attempts times. Without
+// this, accounts-api starting alongside a Postgres that's still doing
+// initdb (docker-compose's depends_on doesn't wait for readiness, and
+// neither does a freshly-rolled pod in k8s without an initContainer) means
+// the very first Ping fails and the process exits before Postgres ever
+// gets a chance to come up.
+func connectWithRetry(logger *slog.Logger, databaseURL string, attempts int, backoff time.Duration) (*pgxpool.Pool, error) {
+	var lastErr error
+	for i := 1; i <= attempts; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		pool, err := store.Connect(ctx, databaseURL)
+		cancel()
+		if err == nil {
+			return pool, nil
+		}
+		lastErr = err
+		logger.Warn("ledger not reachable yet, retrying", "attempt", i, "attempts", attempts, "err", err)
+		time.Sleep(backoff)
+	}
+	return nil, lastErr
 }
