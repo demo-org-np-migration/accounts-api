@@ -8,6 +8,10 @@ on:
 env:
   IMAGE: ghcr.io/demo-org-np-migration/accounts-api
 
+permissions:
+  contents: read
+  packages: write
+
 jobs:
   build-push:
     runs-on: ubuntu-latest
