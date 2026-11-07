@@ -1,6 +1,13 @@
 name: deploy
 
+# nullplatform (modo delegado): cada push construye la imagen y la registra en nullplatform (build, asset, release),
+# pero ya no despliega. El deploy se pide en nullplatform: pasa por su checklist y nullplatform dispara este workflow
+# (repository_dispatch nullplatform-deploy) con el entorno y el tag. El runner y los comandos de deploy son los de siempre.
+run-name: ${{ github.event_name == 'repository_dispatch' && format('nullplatform deploy {0} · {1} · {2}', github.event.client_payload.deployment_id, github.event.client_payload.environment, github.event.client_payload.image_tag) || format('build {0}', github.ref_name) }}
+
 on:
+  repository_dispatch:
+    types: [nullplatform-deploy]
   workflow_dispatch:
   push:
     branches: [main]
@@ -15,11 +22,29 @@ permissions:
 
 jobs:
   build-push:
+    if: github.event_name != 'repository_dispatch'
     runs-on: ubuntu-latest
+    env:
+      NULLPLATFORM_API_KEY: ${{ secrets.NULLPLATFORM_API_KEY }}
     outputs:
       sha_tag: ${{ steps.tag.outputs.sha_tag }}
     steps:
       - uses: actions/checkout@v4
+
+      # nullplatform: el build queda registrado con su commit, rama y run. Si nullplatform falla, el build sigue igual.
+      - name: nullplatform - install CLI
+        continue-on-error: true
+        run: |
+          curl -fsSL https://cli.nullplatform.com/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: nullplatform - build start
+        id: np_build
+        continue-on-error: true
+        run: |
+          np build start --format json > np-build.json
+          echo "id=$(jq -r '.id // empty' np-build.json)" >> "$GITHUB_OUTPUT"
+          echo "application_id=$(jq -r '.application_id // empty' np-build.json)" >> "$GITHUB_OUTPUT"
 
       - name: compute short sha tag
         id: tag
@@ -35,6 +60,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: docker/build-push-action@v6
+        id: push
         with:
           platforms: linux/amd64,linux/arm64
           context: .
@@ -43,30 +69,72 @@ jobs:
             ${{ env.IMAGE }}:${{ steps.tag.outputs.sha_tag }}
             ${{ env.IMAGE }}:latest
 
-  deploy-staging:
-    if: github.ref == 'refs/heads/main'
-    needs: build-push
+      # nullplatform: registra la imagen que ya se subió (la misma URL de ghcr, con su digest).
+      - name: nullplatform - asset
+        if: steps.np_build.outputs.id != ''
+        continue-on-error: true
+        run: |
+          jq -nc \
+            --argjson build_id "${{ steps.np_build.outputs.id }}" \
+            --argjson application_id "${{ steps.np_build.outputs.application_id }}" \
+            --arg url "${{ env.IMAGE }}:${{ steps.tag.outputs.sha_tag }}" \
+            --arg digest "${{ steps.push.outputs.digest }}" \
+            '{build_id: $build_id, application_id: $application_id, name: "main", type: "docker-image", url: $url, metadata: {digest: $digest}}' > asset.json
+          np asset create --body asset.json
+
+      - name: nullplatform - build status
+        if: always() && steps.np_build.outputs.id != ''
+        continue-on-error: true
+        run: np build update --id "${{ steps.np_build.outputs.id }}" --status "${{ job.status == 'success' && 'successful' || 'failed' }}"
+
+      # nullplatform: la release que se despliega desde nullplatform. Tag v1.2.3 → 1.2.3; main → pre-release sobre la
+      # última final, con el número de corrida (0.1.4-12.sha.abc1234). El deploy se pide en nullplatform.
+      - name: nullplatform - release
+        if: success() && steps.np_build.outputs.id != ''
+        continue-on-error: true
+        env:
+          BUILD_ID: ${{ steps.np_build.outputs.id }}
+          APP_ID: ${{ steps.np_build.outputs.application_id }}
+          TAG: ${{ steps.tag.outputs.sha_tag }}
+          RUN: ${{ github.run_number }}
+        run: |
+          umask 077
+          token=$(jq -nc '{api_key: env.NULLPLATFORM_API_KEY}' | curl -sf https://api.nullplatform.com/token -H 'Content-Type: application/json' --data-binary @- | jq -r .access_token)
+          printf 'Authorization: Bearer %s\n' "$token" > np-auth.hdr
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            semver="${GITHUB_REF_NAME#v}"
+          else
+            next=$(curl -sf "https://api.nullplatform.com/release?application_id=$APP_ID&limit=200" -H @np-auth.hdr |
+              jq -r '[.results[].semver | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+$")) | split(".") | map(tonumber)] | sort | (last // [0,0,0]) | "\(.[0]).\(.[1]).\(.[2]+1)"')
+            semver="$next-$RUN.sha.${TAG#sha-}"
+          fi
+          jq -nc --argjson b "$BUILD_ID" --argjson a "$APP_ID" --arg s "$semver" '{application_id: $a, build_id: $b, semver: $s, status: "active"}' |
+            curl -sf -X POST https://api.nullplatform.com/release -H @np-auth.hdr -H 'Content-Type: application/json' --data-binary @- | jq -c '{id, semver}'
+          rm -f np-auth.hdr
+
+  # nullplatform pide el deploy (repository_dispatch) con la release que aprobó su checklist. Este job corre lo mismo que
+  # corría el deploy de siempre, con el runner de siempre, pero con el entorno y el tag que manda nullplatform.
+  # El payload entra por variables de entorno y se valida antes de usarlo: nunca se interpola en el script.
+  nullplatform-deploy:
+    if: github.event_name == 'repository_dispatch'
     runs-on: [self-hosted, cauri-k8s]
+    concurrency:
+      group: deploy-${{ github.event.client_payload.environment }}
+      cancel-in-progress: false
+    env:
+      NP_ENV: ${{ github.event.client_payload.environment }}
+      NP_TAG: ${{ github.event.client_payload.image_tag }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: helm upgrade (staging)
+      - name: Validar el pedido de nullplatform
+        run: |
+          [[ "$NP_ENV" =~ ^(staging|prod)$ ]] || { echo "entorno inválido: $NP_ENV"; exit 1; }
+          [[ "$NP_TAG" =~ ^(sha-[0-9a-f]{7}|v[0-9]+\.[0-9]+\.[0-9]+)$ ]] || { echo "tag inválido: $NP_TAG"; exit 1; }
+
+      - name: helm upgrade
         run: |
           helm upgrade --install accounts-api ./deploy/chart \
-            -n staging \
-            -f deploy/values-staging.yaml \
-            --set image.tag=${{ needs.build-push.outputs.sha_tag }}
-
-  deploy-prod:
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: build-push
-    runs-on: [self-hosted, cauri-k8s]
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: helm upgrade (prod)
-        run: |
-          helm upgrade --install accounts-api ./deploy/chart \
-            -n prod \
-            -f deploy/values-prod.yaml \
-            --set image.tag=${{ needs.build-push.outputs.sha_tag }}
+            -n "$NP_ENV" \
+            -f "deploy/values-$NP_ENV.yaml" \
+            --set image.tag="$NP_TAG"
