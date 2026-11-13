@@ -4,6 +4,7 @@ env:
   ENV: staging
   LOG_LEVEL: info
   KEYCLOAK_ISSUER: http://keycloak.platform.svc:8080/realms/cauri-staging
+  NP_TEST_W: "w1"
 
 postgresSecret:
   create: false
