@@ -16,4 +16,4 @@ serviceMonitor:
   enabled: true
 resources:
   requests:
-    memory: 160Mi
+    memory: 128Mi
